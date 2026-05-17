@@ -367,14 +367,246 @@ echo running > "$TASK_DIR/status"
 
 ${modeSelectScript}
 
-claude -p "$(cat "$TASK_DIR/prompt.txt")" \\
-  $CLAUDE_MODE_FLAG \\
-  --output-format stream-json \\
-  --verbose \\
-  >> "$TASK_DIR/events.jsonl" \\
-  2>> "$TASK_DIR/stderr.log"
+cat > "$TASK_DIR/render-events.js" <<'RENDER_JS'
+const readline = require("readline");
 
-CODE=$?
+const ESC = String.fromCharCode(27) + "[";
+const NL = String.fromCharCode(10);
+const CR = String.fromCharCode(13);
+const style = {
+  reset: ESC + "0m",
+  dim: ESC + "2m",
+  bold: ESC + "1m",
+  cyan: ESC + "36m",
+  green: ESC + "32m",
+  yellow: ESC + "33m",
+  magenta: ESC + "35m",
+  red: ESC + "31m",
+  blue: ESC + "34m",
+  gray: ESC + "90m"
+};
+
+const toolNames = new Map();
+let turn = 0;
+let lastBlock = "";
+
+function color(text, code) {
+  return code + text + style.reset;
+}
+
+function write(text) {
+  process.stdout.write(text + NL);
+}
+
+function blank() {
+  if (lastBlock !== "") {
+    write("");
+  }
+}
+
+function header(label, detail, code) {
+  blank();
+  const suffix = detail ? "  " + detail : "";
+  write(color("== " + label + suffix + " ==", code));
+  lastBlock = label;
+}
+
+function asText(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(asText).filter(Boolean).join(NL);
+  }
+  if (typeof value === "object" && typeof value.text === "string") {
+    return value.text;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+function clip(text, maxChars, maxLines) {
+  let s = asText(text).split(CR).join("");
+  if (s.length > maxChars) {
+    s = s.slice(0, maxChars) + NL + "...";
+  }
+  const lines = s.split(NL);
+  if (lines.length > maxLines) {
+    return lines.slice(0, maxLines).join(NL) + NL + "...";
+  }
+  return s;
+}
+
+function indent(text, prefix) {
+  const body = clip(text, 2200, 28);
+  if (!body) {
+    return;
+  }
+  for (const line of body.split(NL)) {
+    write(prefix + line);
+  }
+}
+
+function field(label, value) {
+  const text = asText(value);
+  if (text) {
+    write("  " + color(label + ": ", style.gray) + text);
+  }
+}
+
+function renderToolUse(item) {
+  const name = item.name || "tool";
+  if (item.id) {
+    toolNames.set(item.id, name);
+  }
+  header("TOOL " + name, "", style.yellow);
+  const input = item.input || {};
+  if (input.description) {
+    indent(input.description, "  ");
+  }
+  if (input.command) {
+    write(color("  $", style.gray));
+    indent(input.command, "    ");
+  }
+  field("file", input.file_path || input.path);
+  field("pattern", input.pattern);
+  field("url", input.url);
+  field("prompt", input.prompt);
+  if (Array.isArray(input.todos)) {
+    for (const todo of input.todos.slice(0, 12)) {
+      const status = todo.status ? "[" + todo.status + "] " : "";
+      write("  - " + status + (todo.content || ""));
+    }
+    if (input.todos.length > 12) {
+      write("  ...");
+    }
+  } else {
+    const shown = new Set(["description", "command", "file_path", "path", "pattern", "url", "prompt", "todos"]);
+    const rest = Object.keys(input).filter((key) => !shown.has(key));
+    for (const key of rest.slice(0, 6)) {
+      field(key, input[key]);
+    }
+  }
+}
+
+function renderToolResult(item) {
+  const name = toolNames.get(item.tool_use_id) || "tool";
+  const failed = item.is_error ? "  failed" : "";
+  header("TOOL RESULT " + name, failed, item.is_error ? style.red : style.green);
+  indent(item.content, "  ");
+}
+
+function renderText(item) {
+  const text = asText(item.text);
+  if (!text.trim()) {
+    return;
+  }
+  header("ASSISTANT", "", style.cyan);
+  indent(text, "  ");
+}
+
+function renderThinking(item) {
+  const text = asText(item.thinking);
+  if (!text.trim()) {
+    return;
+  }
+  header("THINKING", "", style.magenta);
+  indent(text, "  ");
+}
+
+function renderContent(item) {
+  if (!item || typeof item !== "object") {
+    return;
+  }
+  if (item.type === "text") {
+    renderText(item);
+  } else if (item.type === "thinking") {
+    renderThinking(item);
+  } else if (item.type === "tool_use") {
+    renderToolUse(item);
+  } else if (item.type === "tool_result") {
+    renderToolResult(item);
+  }
+}
+
+function renderMessage(event) {
+  const message = event.message || {};
+  const content = Array.isArray(message.content) ? message.content : [];
+  if (event.type === "assistant") {
+    turn += 1;
+  }
+  for (const item of content) {
+    renderContent(item);
+  }
+}
+
+function renderSystem(event) {
+  header("SYSTEM " + (event.subtype || "event"), "", style.blue);
+  field("cwd", event.cwd);
+  field("model", event.model);
+  field("session", event.session_id);
+  if (Array.isArray(event.tools) && event.tools.length > 0) {
+    field("tools", event.tools.join(", "));
+  }
+}
+
+function renderResult(event) {
+  const ok = !event.is_error && event.subtype !== "error";
+  header("RESULT", event.subtype || (ok ? "success" : "failed"), ok ? style.green : style.red);
+  field("turns", event.num_turns);
+  field("duration_ms", event.duration_ms);
+  field("api_ms", event.duration_api_ms);
+  field("cost_usd", event.total_cost_usd);
+  indent(event.result, "  ");
+}
+
+write(color("ManaClaw task console", style.bold + style.cyan));
+write(color("Readable stream is mirrored to console.log; raw JSON remains in events.jsonl.", style.dim));
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  if (!line.trim()) {
+    return;
+  }
+  try {
+    const event = JSON.parse(line);
+    if (event.type === "system") {
+      renderSystem(event);
+    } else if (event.type === "result") {
+      renderResult(event);
+    } else if (event.message) {
+      renderMessage(event);
+    } else {
+      header("EVENT " + (event.type || "unknown"), "", style.gray);
+      indent(JSON.stringify(event, null, 2), "  ");
+    }
+  } catch (_) {
+    header("RAW", "", style.gray);
+    indent(line, "  ");
+  }
+});
+RENDER_JS
+
+: > "$TASK_DIR/console.log"
+CODE_FILE="$TASK_DIR/.claude.exit"
+rm -f "$CODE_FILE"
+
+(
+  claude -p "$(cat "$TASK_DIR/prompt.txt")" \\
+    $CLAUDE_MODE_FLAG \\
+    --output-format stream-json \\
+    --verbose
+  code="$?"
+  echo "$code" > "$CODE_FILE"
+  exit "$code"
+) 2>> "$TASK_DIR/stderr.log" \\
+  | tee -a "$TASK_DIR/events.jsonl" \\
+  | node "$TASK_DIR/render-events.js" \\
+  | tee -a "$TASK_DIR/console.log"
+
+CODE=$(cat "$CODE_FILE" 2>/dev/null || echo 1)
 echo "$CODE" > "$TASK_DIR/exit.code"
 if [ "$CODE" -eq 0 ]; then
   echo completed > "$TASK_DIR/status"
